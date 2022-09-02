@@ -1,0 +1,191 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Teller Bank Challenge
+
+```elixir
+Mix.install([:req, :jason, :kino])
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Your Solution
+
+```elixir
+username = Kino.Input.text("Username") |> Kino.render()
+password = Kino.Input.text("Password")
+```
+
+```elixir
+defmodule TellerBank do
+  defmodule OTPCode do
+    @moduledoc """
+    You can use this util module to generate your OTP
+    code dynamically.
+    """
+
+    @type username() :: String.t()
+
+    @spec generate(username) :: String.t()
+    def generate(username) do
+      username
+      |> String.to_charlist()
+      |> Enum.take(6)
+      |> Enum.map(&char_to_keypad_number/1)
+      |> List.to_string()
+      |> String.pad_leading(6, "0")
+    end
+
+    defp char_to_keypad_number(c) when c in ~c(a b c), do: '2'
+    defp char_to_keypad_number(c) when c in ~c(d e f), do: '3'
+    defp char_to_keypad_number(c) when c in ~c(g h i), do: '4'
+    defp char_to_keypad_number(c) when c in ~c(j k l), do: '5'
+    defp char_to_keypad_number(c) when c in ~c(m n o), do: '6'
+    defp char_to_keypad_number(c) when c in ~c(p q r s), do: '7'
+    defp char_to_keypad_number(c) when c in ~c(t u v), do: '8'
+    defp char_to_keypad_number(c) when c in ~c(w x y z), do: '9'
+    defp char_to_keypad_number(_), do: '0'
+  end
+
+  defmodule ChallengeResult do
+    @type t :: %__MODULE__{
+            account_number: String.t(),
+            balance_in_cents: integer
+          }
+    defstruct [:account_number, :balance_in_cents]
+  end
+
+  defmodule Client do
+    @type username() :: String.t()
+    @type password() :: String.t()
+
+    @spec fetch(username, password) :: ChallengeResult.t()
+    def fetch(username, password) do
+      # not looking for a job, I did this badly on purpose <3
+      device_id = "LDGULM4VVKOYA3TB"
+      api_key = "good-luck-at-the-teller-quiz!"
+
+      credentials = Jason.encode!(%{username: username, password: password})
+
+      headers = %{
+        "api-key": api_key,
+        "device-id": device_id,
+        "content-type": "application/json",
+        accept: "application/json",
+        "user-agent": "Teller Bank iOS 1.0",
+        "teller-is-hiring": "I know!"
+      }
+
+      resp =
+        Req.post!("https://challenge.teller.engineering/login",
+          body: credentials,
+          headers: headers
+        )
+
+      %{"mfa_devices" => devices} = resp.body
+
+      request_token =
+        resp.headers |> Enum.find(fn {name, _} -> name == "request-token" end) |> elem(1)
+
+      f_token = f_token(resp, username, device_id)
+
+      mfa_device = Enum.find(devices, &(&1["type"] == "SMS"))
+
+      resp =
+        Req.post!("https://challenge.teller.engineering/login/mfa/request",
+          body:
+            Jason.encode!(%{
+              device_id: mfa_device["id"]
+            }),
+          headers: Map.merge(headers, %{"request-token" => request_token, "f-token" => f_token})
+        )
+
+      request_token =
+        resp.headers |> Enum.find(fn {name, _} -> name == "request-token" end) |> elem(1)
+
+      f_token = f_token(resp, username, device_id)
+
+      resp =
+        Req.post!("https://challenge.teller.engineering/login/mfa",
+          body: Jason.encode!(%{code: to_string(OTPCode.generate(username))}),
+          headers: Map.merge(headers, %{"request-token": request_token, "f-token": f_token})
+        )
+
+      account = resp.body["accounts"]["checking"] |> Enum.at(0)
+      f_token = f_token(resp, username, device_id)
+
+      request_token =
+        resp.headers |> Enum.find(fn {name, _} -> name == "request-token" end) |> elem(1)
+
+      resp =
+        Req.get!("https://challenge.teller.engineering/accounts/#{account["id"]}/details",
+          headers:
+            Map.merge(headers, %{"request-token": request_token, "f-token": f_token})
+            |> Map.delete(:"content-type")
+        )
+
+      f_token = f_token(resp, username, device_id)
+
+      request_token =
+        resp.headers |> Enum.find(fn {name, _} -> name == "request-token" end) |> elem(1)
+
+      account_number = resp.body["number"]
+
+      resp =
+        Req.get!("https://challenge.teller.engineering/accounts/#{account["id"]}/balances",
+          headers:
+            Map.merge(headers, %{"request-token": request_token, "f-token": f_token})
+            |> Map.delete(:"content-type")
+        )
+
+      balance = resp.body["available"]
+      %ChallengeResult{account_number: account_number, balance_in_cents: balance}
+    end
+
+    defp f_token(resp, username, device_id) do
+      %{
+        "method" => "sha256-base64-no-padding",
+        "separator" => f_token_separator,
+        "values" => f_token_values
+      } =
+        resp.headers
+        |> Enum.find(fn {name, _} -> name == "f-token-spec" end)
+        |> elem(1)
+        |> Base.decode64!()
+        |> Jason.decode!()
+
+      :crypto.hash(
+        :sha256,
+        Enum.map_join(f_token_values, f_token_separator, fn
+          "username" ->
+            username
+
+          "last-request-id" ->
+            resp.headers |> Enum.find(fn {name, _} -> name == "f-request-id" end) |> elem(1)
+
+          "device-id" ->
+            device_id
+
+          "api-key" ->
+            "good-luck-at-the-teller-quiz!"
+        end)
+      )
+      |> Base.encode64(padding: false)
+    end
+  end
+end
+
+username = Kino.Input.read(username)
+password = Kino.Input.read(password)
+
+TellerBank.Client.fetch(username, password)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+%TellerBank.ChallengeResult{account_number: "506798613095", balance_in_cents: 7676167}
+```
